@@ -1,0 +1,36 @@
+import numpy as np
+import shap
+import pandas as pd
+import matplotlib.pyplot as plt
+
+shap.initjs()
+
+# model must have predict_proba
+# X_train_scaled, X_test_scaled are numpy arrays
+# feature_names is list of names in same order
+
+X_train_s = pd.DataFrame(X_train_scaled, columns=feature_names)
+X_test_s  = pd.DataFrame(X_test_scaled, columns=feature_names)
+
+# Use a SMALL background sample to keep it fast
+background = shap.sample(X_train_s, 200, random_state=42)
+
+# Define a function that outputs probability of class 1
+f = lambda x: model.predict_proba(x)[:, 1]
+
+explainer = shap.KernelExplainer(f, background)
+
+# Explain a small subset first (KernelExplainer can be slow)
+X_explain = X_test_s.sample(200, random_state=42)
+
+shap_values = explainer.shap_values(X_explain, nsamples=200)  # increase nsamples for stability
+
+plt.figure()
+shap.summary_plot(shap_values, X_explain, show=False)
+plt.tight_layout()
+plt.show()
+
+plt.figure()
+shap.summary_plot(shap_values, X_explain, plot_type="bar", show=False)
+plt.tight_layout()
+plt.show()
