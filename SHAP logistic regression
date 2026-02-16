@@ -1,0 +1,70 @@
+import numpy as np
+import shap
+import matplotlib.pyplot as plt
+
+# If you used a DataFrame originally:
+# feature_names = X_train.columns.tolist()
+
+# Make sure shap plots render in notebooks (optional)
+shap.initjs()
+
+# ---------------------------------------------
+# Inputs you should already have
+# ---------------------------------------------
+# model            -> fitted LogisticRegression
+# X_train_scaled   -> numpy array used to train
+# X_test_scaled    -> numpy array for test
+# feature_names    -> list of feature names (same order as columns)
+
+# Convert arrays to DataFrame for nicer SHAP outputs
+import pandas as pd
+X_train_s = pd.DataFrame(X_train_scaled, columns=feature_names)
+X_test_s  = pd.DataFrame(X_test_scaled, columns=feature_names)
+
+# ---------------------------------------------
+# SHAP explainer for linear models
+# ---------------------------------------------
+# For binary logistic regression, SHAP values are in log-odds space by default.
+explainer = shap.LinearExplainer(model, X_train_s)  # background = training distribution
+shap_values = explainer.shap_values(X_test_s)       # shape: (n_samples, n_features)
+
+# ---------------------------------------------
+# Global importance (summary)
+# ---------------------------------------------
+plt.figure()
+shap.summary_plot(shap_values, X_test_s, show=False)  # beeswarm
+plt.tight_layout()
+plt.show()
+
+plt.figure()
+shap.summary_plot(shap_values, X_test_s, plot_type="bar", show=False)  # bar importance
+plt.tight_layout()
+plt.show()
+
+# ---------------------------------------------
+# Local explanation for 1 row
+# ---------------------------------------------
+i = 0  # pick an index
+# Waterfall is a good local explanation
+plt.figure()
+shap.plots.waterfall(shap.Explanation(
+    values=shap_values[i],
+    base_values=explainer.expected_value,
+    data=X_test_s.iloc[i],
+    feature_names=feature_names
+), show=False)
+plt.tight_layout()
+plt.show()
+
+# ---------------------------------------------
+# If you want contributions in probability space (optional)
+# ---------------------------------------------
+# SHAP for logistic regression is naturally additive in log-odds.
+# You can transform to probability if you want an approximate probability contribution view.
+def sigmoid(z):
+    return 1 / (1 + np.exp(-z))
+
+base_logit = explainer.expected_value
+row_logit = base_logit + shap_values[i].sum()
+print("Base probability:", sigmoid(base_logit))
+print("Row probability :", sigmoid(row_logit))
