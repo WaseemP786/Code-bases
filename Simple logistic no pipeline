@@ -1,0 +1,134 @@
+"""
+Simple Logistic Regression Classification (No Pipelines)
+
+This is a basic implementation:
+- Manual preprocessing
+- Manual scaling
+- Direct model fitting
+- Basic evaluation metrics
+
+Dependencies:
+pip install numpy pandas scikit-learn matplotlib
+"""
+
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import StandardScaler
+from sklearn.linear_model import LogisticRegression
+from sklearn.metrics import (
+    accuracy_score,
+    precision_score,
+    recall_score,
+    f1_score,
+    roc_auc_score,
+    confusion_matrix,
+    ConfusionMatrixDisplay,
+    roc_curve
+)
+
+# --------------------------------------------------
+# 1. CREATE SAMPLE DATA
+# --------------------------------------------------
+np.random.seed(42)
+n = 1500
+
+df = pd.DataFrame({
+    "age": np.random.normal(40, 10, n),
+    "income": np.random.normal(50000, 12000, n),
+})
+
+# Create binary target
+logit = 0.05 * df["age"] + 0.00005 * df["income"] - 4
+prob = 1 / (1 + np.exp(-logit))
+df["target"] = np.random.binomial(1, prob)
+
+print("Positive rate:", df["target"].mean())
+
+# --------------------------------------------------
+# 2. DEFINE FEATURES AND TARGET
+# --------------------------------------------------
+X = df[["age", "income"]]
+y = df["target"]
+
+# --------------------------------------------------
+# 3. TRAIN / TEST SPLIT
+# --------------------------------------------------
+X_train, X_test, y_train, y_test = train_test_split(
+    X, y,
+    test_size=0.2,
+    random_state=42
+)
+
+# --------------------------------------------------
+# 4. SCALE FEATURES (IMPORTANT FOR LOGISTIC REGRESSION)
+# --------------------------------------------------
+scaler = StandardScaler()
+
+# Fit only on training data
+X_train_scaled = scaler.fit_transform(X_train)
+
+# Transform test data
+X_test_scaled = scaler.transform(X_test)
+
+# --------------------------------------------------
+# 5. FIT LOGISTIC REGRESSION MODEL
+# --------------------------------------------------
+model = LogisticRegression()
+model.fit(X_train_scaled, y_train)
+
+# --------------------------------------------------
+# 6. MAKE PREDICTIONS
+# --------------------------------------------------
+y_pred = model.predict(X_test_scaled)
+y_prob = model.predict_proba(X_test_scaled)[:, 1]
+
+# --------------------------------------------------
+# 7. EVALUATION METRICS
+# --------------------------------------------------
+print("\n=== Metrics ===")
+print("Accuracy :", round(accuracy_score(y_test, y_pred), 4))
+print("Precision:", round(precision_score(y_test, y_pred), 4))
+print("Recall   :", round(recall_score(y_test, y_pred), 4))
+print("F1 Score :", round(f1_score(y_test, y_pred), 4))
+print("ROC AUC  :", round(roc_auc_score(y_test, y_prob), 4))
+
+# --------------------------------------------------
+# 8. CONFUSION MATRIX
+# --------------------------------------------------
+cm = confusion_matrix(y_test, y_pred)
+disp = ConfusionMatrixDisplay(cm)
+disp.plot()
+plt.title("Confusion Matrix")
+plt.show()
+
+# --------------------------------------------------
+# 9. ROC CURVE
+# --------------------------------------------------
+fpr, tpr, _ = roc_curve(y_test, y_prob)
+
+plt.plot(fpr, tpr)
+plt.plot([0, 1], [0, 1], linestyle="--")
+plt.title("ROC Curve")
+plt.xlabel("False Positive Rate")
+plt.ylabel("True Positive Rate")
+plt.show()
+
+# --------------------------------------------------
+# 10. COEFFICIENTS
+# --------------------------------------------------
+coefficients = pd.DataFrame({
+    "feature": X.columns,
+    "coefficient": model.coef_[0]
+})
+
+print("\nModel Coefficients:")
+print(coefficients)
+
+"""
+Interpretation:
+- Positive coefficient → increases probability of class 1
+- Negative coefficient → decreases probability of class 1
+"""
