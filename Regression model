@@ -1,0 +1,496 @@
+"""
+End-to-end Regression Template (scikit-learn)
+
+What this script covers:
+- Train/validation/test split (with leakage-safe preprocessing via Pipeline/ColumnTransformer)
+- Baseline model + strong regularized linear + tree ensemble (HistGradientBoosting)
+- Robust metrics: RMSE, MAE, R^2, MAPE, MedAE, explained variance
+- K-fold cross-validation (multiple metrics)
+- Residual diagnostics: residual plots, QQ-plot, normality test (Jarque–Bera), heteroscedasticity test (Breusch–Pagan)
+- Outlier influence (Cook's distance) using a statsmodels OLS on a preprocessed design matrix
+- Learning curve (diagnose bias/variance)
+- Feature importance / coefficients (where applicable)
+- Model comparison + final fit + test evaluation
+
+Dependencies:
+pip install numpy pandas scikit-learn matplotlib statsmodels scipy
+"""
+
+from __future__ import annotations
+
+import warnings
+warnings.filterwarnings("ignore")
+
+import numpy as np
+import pandas as pd
+
+import matplotlib.pyplot as plt
+
+from scipy import stats
+
+from sklearn.compose import ColumnTransformer
+from sklearn.pipeline import Pipeline
+from sklearn.impute import SimpleImputer
+from sklearn.preprocessing import OneHotEncoder, StandardScaler
+from sklearn.model_selection import (
+    train_test_split,
+    KFold,
+    cross_validate,
+    learning_curve
+)
+from sklearn.metrics import (
+    mean_squared_error,
+    mean_absolute_error,
+    median_absolute_error,
+    r2_score,
+    explained_variance_score
+)
+from sklearn.dummy import DummyRegressor
+from sklearn.linear_model import Ridge
+from sklearn.ensemble import HistGradientBoostingRegressor
+
+import statsmodels.api as sm
+from statsmodels.stats.stattools import jarque_bera
+from statsmodels.stats.diagnostic import het_breuschpagan
+from statsmodels.stats.outliers_influence import OLSInfluence
+
+
+# -----------------------------
+# 1) USER INPUTS / DATA LOADING
+# -----------------------------
+# Replace this with your data load.
+# Example:
+# df = pd.read_csv("your_dataset.csv")
+#
+# Then set:
+# target_col = "your_target"
+
+def make_synthetic_regression_data(n: int = 3000, random_state: int = 42) -> pd.DataFrame:
+    """
+    Creates a mixed-type dataset (numeric + categorical) to make the template runnable.
+    Replace with your own dataset.
+    """
+    rng = np.random.default_rng(random_state)
+
+    # Numeric features
+    x1 = rng.normal(0, 1, n)
+    x2 = rng.normal(2, 1.5, n)
+    x3 = rng.lognormal(mean=0.2, sigma=0.6, size=n)
+
+    # Categorical features
+    city = rng.choice(["JHB", "CPT", "DBN", "PTA"], size=n, p=[0.45, 0.25, 0.2, 0.1])
+    segment = rng.choice(["Retail", "SME", "Corp"], size=n, p=[0.6, 0.3, 0.1])
+
+    # Nonlinear target with noise
+    noise = rng.normal(0, 1.5, n)
+    y = (
+        3.0 * x1
+        - 1.8 * x2
+        + 2.2 * np.log1p(x3)
+        + (city == "CPT") * 2.5
+        + (city == "DBN") * (-1.0)
+        + (segment == "Corp") * 3.0
+        + 0.8 * x1 * (segment == "SME")  # interaction
+        + noise
+    )
+
+    df = pd.DataFrame(
+        {
+            "x1": x1,
+            "x2": x2,
+            "x3": x3,
+            "city": city,
+            "segment": segment,
+            "target": y
+        }
+    )
+
+    # Add some missingness to demonstrate imputers
+    missing_idx = rng.choice(np.arange(n), size=int(0.03 * n), replace=False)
+    df.loc[missing_idx, "x2"] = np.nan
+
+    return df
+
+
+# --- Load / create data
+df = make_synthetic_regression_data(n=4000, random_state=42)
+target_col = "target"
+
+# Separate features/target
+X = df.drop(columns=[target_col])
+y = df[target_col].astype(float)
+
+# Identify column types
+numeric_cols = X.select_dtypes(include=["number"]).columns.tolist()
+categorical_cols = X.select_dtypes(exclude=["number"]).columns.tolist()
+
+
+# -----------------------------
+# 2) SPLIT DATA (LEAKAGE SAFE)
+# -----------------------------
+# Use a three-way split:
+# - Train: fit models
+# - Validation: compare/tune models
+# - Test: final unbiased evaluation
+X_trainval, X_test, y_trainval, y_test = train_test_split(
+    X, y, test_size=0.20, random_state=42
+)
+X_train, X_val, y_train, y_val = train_test_split(
+    X_trainval, y_trainval, test_size=0.25, random_state=42
+)
+# Resulting: Train 60%, Val 20%, Test 20%
+
+
+# -----------------------------------------
+# 3) PREPROCESSING (NUMERIC + CATEGORICAL)
+# -----------------------------------------
+# Numeric pipeline:
+# - impute missing values with median
+# - scale features (helps linear models; tree models are fine too)
+numeric_pipe = Pipeline(
+    steps=[
+        ("imputer", SimpleImputer(strategy="median")),
+        ("scaler", StandardScaler())
+    ]
+)
+
+# Categorical pipeline:
+# - impute missing values with most frequent
+# - one-hot encode unseen categories safely via handle_unknown="ignore"
+categorical_pipe = Pipeline(
+    steps=[
+        ("imputer", SimpleImputer(strategy="most_frequent")),
+        ("onehot", OneHotEncoder(handle_unknown="ignore", sparse_output=False))
+    ]
+)
+
+# ColumnTransformer applies the correct preprocessing per column subset
+preprocess = ColumnTransformer(
+    transformers=[
+        ("num", numeric_pipe, numeric_cols),
+        ("cat", categorical_pipe, categorical_cols),
+    ],
+    remainder="drop",
+    verbose_feature_names_out=False
+)
+
+
+# -----------------------------
+# 4) METRICS + HELPERS
+# -----------------------------
+def regression_metrics(y_true: np.ndarray, y_pred: np.ndarray) -> dict:
+    """
+    Computes a suite of regression metrics.
+    Notes:
+    - RMSE is sensitive to outliers, MAE is more robust.
+    - MAPE can be problematic if y_true has values near 0; we guard with epsilon.
+    """
+    y_true = np.asarray(y_true)
+    y_pred = np.asarray(y_pred)
+
+    mse = mean_squared_error(y_true, y_pred)
+    rmse = float(np.sqrt(mse))
+    mae = float(mean_absolute_error(y_true, y_pred))
+    medae = float(median_absolute_error(y_true, y_pred))
+    r2 = float(r2_score(y_true, y_pred))
+    evs = float(explained_variance_score(y_true, y_pred))
+
+    eps = 1e-8
+    mape = float(np.mean(np.abs((y_true - y_pred) / np.maximum(np.abs(y_true), eps))) * 100.0)
+
+    return {
+        "RMSE": rmse,
+        "MAE": mae,
+        "MedAE": medae,
+        "R2": r2,
+        "ExplainedVar": evs,
+        "MAPE_%": mape
+    }
+
+
+def print_metric_report(title: str, y_true: np.ndarray, y_pred: np.ndarray) -> None:
+    """Pretty-print metrics for a split."""
+    m = regression_metrics(y_true, y_pred)
+    print(f"\n{title}")
+    print("-" * len(title))
+    for k, v in m.items():
+        if k == "R2":
+            print(f"{k:>14}: {v:0.4f}")
+        else:
+            print(f"{k:>14}: {v:0.4f}")
+
+
+# ---------------------------------------
+# 5) DEFINE MODELS (BASELINE + CANDIDATES)
+# ---------------------------------------
+# Baseline: predicts mean(y_train) (a sanity check)
+baseline = Pipeline(
+    steps=[
+        ("preprocess", preprocess),
+        ("model", DummyRegressor(strategy="mean"))
+    ]
+)
+
+# Regularized linear model
+ridge = Pipeline(
+    steps=[
+        ("preprocess", preprocess),
+        ("model", Ridge(alpha=1.0, random_state=42))
+    ]
+)
+
+# Strong non-linear model (fast, handles interactions well)
+hgb = Pipeline(
+    steps=[
+        ("preprocess", preprocess),
+        ("model", HistGradientBoostingRegressor(
+            learning_rate=0.05,
+            max_depth=None,
+            max_iter=400,
+            random_state=42
+        ))
+    ]
+)
+
+models = {
+    "BaselineMean": baseline,
+    "Ridge": ridge,
+    "HistGB": hgb
+}
+
+
+# ---------------------------------------
+# 6) TRAIN + VALIDATE (MODEL SELECTION)
+# ---------------------------------------
+val_results = []
+
+for name, pipe in models.items():
+    # Fit ONLY on training data
+    pipe.fit(X_train, y_train)
+
+    # Predict on train and validation splits
+    yhat_train = pipe.predict(X_train)
+    yhat_val = pipe.predict(X_val)
+
+    # Report
+    print_metric_report(f"{name} - TRAIN", y_train, yhat_train)
+    print_metric_report(f"{name} - VALID", y_val, yhat_val)
+
+    # Keep a compact table for selection (use RMSE primarily, plus R^2 as secondary)
+    m_val = regression_metrics(y_val, yhat_val)
+    val_results.append((name, m_val["RMSE"], m_val["MAE"], m_val["R2"]))
+
+val_df = pd.DataFrame(val_results, columns=["model", "val_RMSE", "val_MAE", "val_R2"]).sort_values("val_RMSE")
+print("\nValidation comparison (lower RMSE is better):")
+print(val_df.to_string(index=False))
+
+
+# ---------------------------------------
+# 7) CROSS-VALIDATION (MORE STABLE ESTIMATE)
+# ---------------------------------------
+# Use KFold for regression (shuffle=True for robustness)
+cv = KFold(n_splits=5, shuffle=True, random_state=42)
+
+scoring = {
+    "rmse": "neg_root_mean_squared_error",  # sklearn uses negative for losses
+    "mae": "neg_mean_absolute_error",
+    "r2": "r2"
+}
+
+print("\nCross-validation (5-fold) summary:")
+for name, pipe in models.items():
+    cv_out = cross_validate(
+        pipe,
+        X_trainval, y_trainval,     # use train+val for CV
+        cv=cv,
+        scoring=scoring,
+        return_train_score=False,
+        n_jobs=-1
+    )
+
+    # Convert negatives back to positive losses
+    rmse = -cv_out["test_rmse"]
+    mae = -cv_out["test_mae"]
+    r2 = cv_out["test_r2"]
+
+    print(f"\n{name}")
+    print(f"  RMSE: mean={rmse.mean():0.4f}, std={rmse.std():0.4f}")
+    print(f"  MAE : mean={mae.mean():0.4f}, std={mae.std():0.4f}")
+    print(f"  R^2 : mean={r2.mean():0.4f}, std={r2.std():0.4f}")
+
+
+# ---------------------------------------------------------
+# 8) PICK BEST MODEL (BY VALIDATION RMSE) AND REFIT
+# ---------------------------------------------------------
+best_model_name = val_df.iloc[0]["model"]
+best_model = models[best_model_name]
+
+print(f"\nSelected best model by validation RMSE: {best_model_name}")
+
+# Refit on ALL train+val data (still not touching test)
+best_model.fit(X_trainval, y_trainval)
+
+# Final evaluation on test set
+yhat_test = best_model.predict(X_test)
+print_metric_report(f"{best_model_name} - TEST", y_test, yhat_test)
+
+
+# ---------------------------------------
+# 9) RESIDUAL DIAGNOSTICS + TESTS
+# ---------------------------------------
+# Residuals on the TEST split (final evaluation)
+residuals = y_test.values - yhat_test
+
+# 9.1 Residual histogram
+plt.figure()
+plt.hist(residuals, bins=40)
+plt.title("Residuals Histogram (Test)")
+plt.xlabel("Residual (y_true - y_pred)")
+plt.ylabel("Count")
+plt.show()
+
+# 9.2 Residuals vs predictions (check non-linearity / heteroscedasticity)
+plt.figure()
+plt.scatter(yhat_test, residuals, s=10)
+plt.axhline(0, linewidth=1)
+plt.title("Residuals vs Predictions (Test)")
+plt.xlabel("Predicted")
+plt.ylabel("Residual")
+plt.show()
+
+# 9.3 Q-Q plot (check normality of residuals)
+plt.figure()
+sm.qqplot(residuals, line="45", fit=True)
+plt.title("Q-Q Plot of Residuals (Test)")
+plt.show()
+
+# 9.4 Jarque–Bera test for normality (H0: residuals are normally distributed)
+jb_stat, jb_pvalue, skew, kurt = jarque_bera(residuals)
+print("\nJarque–Bera normality test (Test residuals)")
+print(f"  JB stat = {jb_stat:0.4f}, p-value = {jb_pvalue:0.6f}")
+print(f"  skew = {skew:0.4f}, kurtosis = {kurt:0.4f}")
+print("  Interpretation: small p-value suggests residuals deviate from normality.")
+
+# 9.5 Breusch–Pagan test for heteroscedasticity (requires a linear design matrix)
+# For a fair diagnostic, we build a preprocessed matrix X_test_design (no leakage: preprocess is already fit)
+X_test_design = best_model.named_steps["preprocess"].transform(X_test)
+# Add constant for statsmodels
+X_test_design_const = sm.add_constant(X_test_design, has_constant="add")
+bp_lm, bp_lm_p, bp_f, bp_f_p = het_breuschpagan(residuals, X_test_design_const)
+print("\nBreusch–Pagan heteroscedasticity test (Test residuals)")
+print(f"  LM stat = {bp_lm:0.4f}, p-value = {bp_lm_p:0.6f}")
+print(f"  F stat  = {bp_f:0.4f}, p-value = {bp_f_p:0.6f}")
+print("  Interpretation: small p-value suggests heteroscedasticity (non-constant variance).")
+
+
+# ---------------------------------------------------
+# 10) OUTLIER / INFLUENCE CHECK (COOK'S DISTANCE)
+# ---------------------------------------------------
+# Influence diagnostics are defined for linear regression models.
+# We run an OLS on the preprocessed design matrix purely for influence analysis.
+# This does NOT change your best model — it just helps identify problematic points.
+
+ols = sm.OLS(y_test.values, X_test_design_const).fit()
+influence = OLSInfluence(ols)
+cooks_d = influence.cooks_distance[0]
+
+# Common heuristic: points with Cook's D > 4/n may be influential
+threshold = 4 / len(y_test)
+n_influential = int((cooks_d > threshold).sum())
+
+print("\nInfluence diagnostics (Test split, OLS on preprocessed features)")
+print(f"  Cook's D threshold (4/n): {threshold:0.6f}")
+print(f"  Influential points above threshold: {n_influential} / {len(y_test)}")
+
+plt.figure()
+plt.stem(cooks_d, markerfmt=",", basefmt=" ")
+plt.axhline(threshold, linewidth=1)
+plt.title("Cook's Distance (Test) - OLS Influence Diagnostic")
+plt.xlabel("Test observation index")
+plt.ylabel("Cook's D")
+plt.show()
+
+
+# ---------------------------------------
+# 11) LEARNING CURVE (BIAS / VARIANCE)
+# ---------------------------------------
+# Learning curve uses CV to estimate train vs validation performance as sample size grows.
+train_sizes, train_scores, val_scores = learning_curve(
+    best_model,
+    X_trainval, y_trainval,
+    cv=cv,
+    scoring="neg_root_mean_squared_error",
+    train_sizes=np.linspace(0.1, 1.0, 6),
+    n_jobs=-1
+)
+
+train_rmse = -train_scores.mean(axis=1)
+val_rmse = -val_scores.mean(axis=1)
+
+plt.figure()
+plt.plot(train_sizes, train_rmse, marker="o", label="Train RMSE")
+plt.plot(train_sizes, val_rmse, marker="o", label="CV RMSE")
+plt.title(f"Learning Curve (RMSE) - {best_model_name}")
+plt.xlabel("Training set size")
+plt.ylabel("RMSE")
+plt.legend()
+plt.show()
+
+
+# ---------------------------------------
+# 12) MODEL INTERPRETABILITY (OPTIONAL)
+# ---------------------------------------
+# Feature names after preprocessing (useful for coefficients/importance)
+feature_names = best_model.named_steps["preprocess"].get_feature_names_out()
+
+# If the selected model is Ridge, show top coefficients
+if best_model_name == "Ridge":
+    coef = best_model.named_steps["model"].coef_
+    coef_df = pd.DataFrame({"feature": feature_names, "coef": coef})
+    coef_df["abs_coef"] = coef_df["coef"].abs()
+    coef_df = coef_df.sort_values("abs_coef", ascending=False).head(25)
+    print("\nTop 25 Ridge coefficients by absolute magnitude:")
+    print(coef_df[["feature", "coef"]].to_string(index=False))
+
+# If the selected model is HistGB, show permutation importance (model-agnostic)
+if best_model_name == "HistGB":
+    from sklearn.inspection import permutation_importance
+
+    perm = permutation_importance(
+        best_model,
+        X_test, y_test,
+        n_repeats=10,
+        random_state=42,
+        scoring="neg_root_mean_squared_error",
+        n_jobs=-1
+    )
+
+    imp = pd.DataFrame(
+        {
+            "feature": feature_names,
+            "importance_mean": perm.importances_mean,
+            "importance_std": perm.importances_std
+        }
+    ).sort_values("importance_mean", ascending=False).head(25)
+
+    print("\nTop 25 permutation importances (higher = more important):")
+    print(imp.to_string(index=False))
+
+    plt.figure()
+    plt.barh(imp["feature"][::-1], imp["importance_mean"][::-1])
+    plt.title("Top Permutation Importances (Test)")
+    plt.xlabel("Mean importance (Δ score)")
+    plt.ylabel("Feature")
+    plt.tight_layout()
+    plt.show()
+
+
+# ---------------------------------------
+# 13) QUICK SUMMARY / NEXT STEPS
+# ---------------------------------------
+print("\nDone.")
+print("Next steps you might add:")
+print("- Hyperparameter tuning with GridSearchCV / RandomizedSearchCV")
+print("- Quantile regression / prediction intervals")
+print("- Segment-wise error analysis (e.g., by city/segment)")
+print("- Calibration of uncertainty via conformal prediction")
