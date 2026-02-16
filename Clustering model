@@ -1,0 +1,197 @@
+"""
+Simple K-Means Clustering Example (scikit-learn)
+------------------------------------------------
+Includes:
+- Synthetic dataset (replace with your data)
+- Preprocessing (impute + scale; optional one-hot for categoricals)
+- Fit KMeans
+- Choose K using Elbow + Silhouette
+- Evaluate with inertia + silhouette score
+- Inspect cluster sizes and centroids (in scaled space)
+- Visualize clusters with PCA (2D)
+
+Dependencies:
+pip install numpy pandas scikit-learn matplotlib
+"""
+
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+
+from sklearn.model_selection import train_test_split
+from sklearn.compose import ColumnTransformer
+from sklearn.pipeline import Pipeline
+from sklearn.preprocessing import StandardScaler, OneHotEncoder
+from sklearn.impute import SimpleImputer
+from sklearn.cluster import KMeans
+from sklearn.metrics import silhouette_score
+from sklearn.decomposition import PCA
+
+# --------------------------------------------------
+# 1) CREATE SYNTHETIC DATA (Replace with your data)
+# --------------------------------------------------
+np.random.seed(42)
+n = 2500
+
+df = pd.DataFrame({
+    "age": np.random.normal(40, 12, n),
+    "income": np.random.normal(50000, 18000, n),
+    "tenure_months": np.random.gamma(shape=2.5, scale=10, size=n),  # skewed numeric feature
+    "city": np.random.choice(["JHB", "CPT", "DBN"], n, p=[0.5, 0.3, 0.2]),
+})
+
+# Add a little structure (so clusters are visible)
+# e.g., CPT slightly higher income, DBN slightly lower tenure
+df.loc[df["city"] == "CPT", "income"] += 12000
+df.loc[df["city"] == "DBN", "tenure_months"] -= 5
+
+# Optional: introduce some missing values to demonstrate imputers
+missing_idx = np.random.choice(df.index, size=int(0.02 * n), replace=False)
+df.loc[missing_idx, "income"] = np.nan
+
+# In clustering we typically cluster only on features (no y)
+X = df.copy()
+
+# Identify numeric and categorical columns
+numeric_cols = X.select_dtypes(include=["number"]).columns.tolist()
+categorical_cols = X.select_dtypes(exclude=["number"]).columns.tolist()
+
+# --------------------------------------------------
+# 2) PREPROCESSING (IMPORTANT FOR K-MEANS)
+# --------------------------------------------------
+# KMeans uses Euclidean distance -> scaling is critical for numeric features.
+numeric_pipeline = Pipeline([
+    ("imputer", SimpleImputer(strategy="median")),
+    ("scaler", StandardScaler())
+])
+
+# If you have categoricals, you can one-hot them.
+# Note: One-hot increases dimensionality; consider dropping categoricals or using k-prototypes if many.
+categorical_pipeline = Pipeline([
+    ("imputer", SimpleImputer(strategy="most_frequent")),
+    ("onehot", OneHotEncoder(handle_unknown="ignore"))
+])
+
+preprocessor = ColumnTransformer([
+    ("num", numeric_pipeline, numeric_cols),
+    ("cat", categorical_pipeline, categorical_cols)
+])
+
+# Fit/transform once for analysis (simple workflow)
+X_proc = preprocessor.fit_transform(X)
+
+# --------------------------------------------------
+# 3) PICK K: ELBOW (INERTIA) + SILHOUETTE
+# --------------------------------------------------
+# Inertia: sum of squared distances to cluster centers (lower is better, but always decreases with k)
+# Silhouette: [-1,1], higher is better (roughly: >0.5 good, 0.2-0.5 ok, <0.2 weak)
+k_values = range(2, 11)
+inertias = []
+silhouettes = []
+
+for k in k_values:
+    kmeans = KMeans(n_clusters=k, n_init=10, random_state=42)
+    labels = kmeans.fit_predict(X_proc)
+
+    inertias.append(kmeans.inertia_)
+    silhouettes.append(silhouette_score(X_proc, labels))
+
+# Plot Elbow
+plt.figure()
+plt.plot(list(k_values), inertias, marker="o")
+plt.title("Elbow Plot (Inertia vs K)")
+plt.xlabel("K")
+plt.ylabel("Inertia")
+plt.show()
+
+# Plot Silhouette
+plt.figure()
+plt.plot(list(k_values), silhouettes, marker="o")
+plt.title("Silhouette Score vs K")
+plt.xlabel("K")
+plt.ylabel("Silhouette Score")
+plt.show()
+
+# Choose K (simple heuristic: best silhouette)
+best_k = int(list(k_values)[int(np.argmax(silhouettes))])
+print(f"Suggested K (max silhouette): {best_k}")
+
+# --------------------------------------------------
+# 4) FIT FINAL KMEANS MODEL
+# --------------------------------------------------
+k = best_k  # or manually set, e.g. k = 4
+final_kmeans = KMeans(n_clusters=k, n_init=10, random_state=42)
+cluster_labels = final_kmeans.fit_predict(X_proc)
+
+# Attach clusters back to original data for profiling
+df_clusters = df.copy()
+df_clusters["cluster"] = cluster_labels
+
+print("\nCluster counts:")
+print(df_clusters["cluster"].value_counts().sort_index())
+
+print("\nSilhouette score (final):", round(silhouette_score(X_proc, cluster_labels), 4))
+print("Inertia (final):", round(final_kmeans.inertia_, 2))
+
+# --------------------------------------------------
+# 5) CLUSTER PROFILING (WHAT DEFINES EACH CLUSTER?)
+# --------------------------------------------------
+# For numeric columns: look at means/medians by cluster in original units
+print("\nNumeric feature means by cluster (original units):")
+print(df_clusters.groupby("cluster")[numeric_cols].mean().round(2))
+
+print("\nNumeric feature medians by cluster (original units):")
+print(df_clusters.groupby("cluster")[numeric_cols].median().round(2))
+
+# For categoricals: distribution by cluster
+for col in categorical_cols:
+    print(f"\n'{col}' distribution by cluster (%):")
+    pct = (
+        df_clusters.groupby("cluster")[col]
+        .value_counts(normalize=True)
+        .rename("pct")
+        .mul(100)
+        .round(1)
+        .reset_index()
+        .sort_values(["cluster", "pct"], ascending=[True, False])
+    )
+    print(pct.to_string(index=False))
+
+# Note: cluster centers are in preprocessed (scaled/one-hot) space.
+# Interpreting raw centers directly is harder when you have one-hot features.
+
+# --------------------------------------------------
+# 6) VISUALIZE CLUSTERS (PCA -> 2D)
+# --------------------------------------------------
+# PCA is just for visualization; KMeans runs in the full feature space.
+pca = PCA(n_components=2, random_state=42)
+X_2d = pca.fit_transform(X_proc)
+
+plt.figure()
+plt.scatter(X_2d[:, 0], X_2d[:, 1], c=cluster_labels, s=10)
+plt.title("K-Means Clusters Visualized with PCA (2D)")
+plt.xlabel("PC1")
+plt.ylabel("PC2")
+plt.show()
+
+# --------------------------------------------------
+# 7) (OPTIONAL) SIMPLE “PREDICT NEW DATA” WORKFLOW
+# --------------------------------------------------
+# In production, always wrap preprocess + model in a single Pipeline.
+cluster_pipe = Pipeline([
+    ("preprocess", preprocessor),
+    ("kmeans", KMeans(n_clusters=k, n_init=10, random_state=42))
+])
+
+cluster_pipe.fit(X)
+
+# Example new customers to assign to clusters
+new_points = pd.DataFrame({
+    "age": [28, 55],
+    "income": [42000, 90000],
+    "tenure_months": [6, 40],
+    "city": ["JHB", "CPT"]
+})
+
+new_clusters = cluster_pipe.predict(new_points)
+print("\nNew points assigned clusters:", new_clusters)
